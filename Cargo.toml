@@ -9,6 +9,9 @@ edition = "2018"
 [dependencies]
 obj-rs = "0.6"
 anyhow = "1.0"
-nalgebra = "0.28"
+nalgebra = { version = "0.28", features = ["serde-serialize"] }
 float-cmp = "0.8"
 itertools = "0.10.1"
+rayon = "1.5.1"
+serde = "1.0.126"
+serde_yaml = "0.8.17"
