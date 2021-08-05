@@ -1,31 +1,184 @@
-use crate::geometry::{collapse_planes, Plane, PlaneSide, Polygon, Vertex};
+//! This module converts a Wavefront OBJ to a basic auto-partitioned BSP tree.
+//! Each node in the tree describes a plane and list of simple polygons, each
+//! with an arbitrary number of vertices, which are guaranteed to be coplanar.
+
+use crate::geometry::{OrthonormalBasis2D, Plane, Vertex};
 use anyhow::{anyhow, Result};
 use float_cmp::approx_eq;
 use itertools::izip;
 use nalgebra::{Vector2, Vector3};
 use obj::raw::RawObj;
 use rayon::prelude::*;
-use serde::Serialize;
+use std::borrow::Borrow;
 use std::collections::hash_map::Entry::{Occupied, Vacant};
 use std::collections::{HashMap, HashSet};
 
-#[derive(Serialize, Debug)]
-struct ClassifiedPolygons {
+pub struct BasicBspTree {
+    pub nodes: Vec<BasicBspNode>,
+    pub texture_names: Vec<String>,
+}
+
+impl BasicBspTree {
+    pub fn from_wavefront_obj(obj: RawObj) -> Result<Self> {
+        let (polygons, texture_names) = collect_polygons_from_obj(obj)?;
+
+        let planes: Vec<Plane> = polygons
+            .par_iter()
+            .map(|polygon| polygon.to_plane())
+            .collect();
+
+        if izip!(&polygons, &planes).any(|(polygon, plane)| !polygon.is_planar(plane)) {
+            return Err(anyhow!("Non-planar polygon encountered"));
+        }
+
+        let collapsed_planes = collapse_planes(&planes);
+
+        let classifications = collapsed_planes
+            .into_par_iter()
+            .map(|(plane, coplanar_ixs)| {
+                PolygonPlaneClassification::new(plane, coplanar_ixs, &polygons)
+            })
+            .collect();
+
+        let nodes = build_tree(polygons, classifications);
+
+        Ok(BasicBspTree {
+            nodes,
+            texture_names,
+        })
+    }
+}
+
+#[derive(Clone, Copy)]
+enum PlaneSide {
+    Front,
+    Back,
+    Coplanar,
+}
+
+#[derive(Clone)]
+pub struct BasicBspPolygon {
+    pub vertices: Vec<Vertex>,
+    pub texture_ix: usize,
+}
+
+impl BasicBspPolygon {
+    fn new(vertices: Vec<Vertex>, texture_ix: usize) -> Self {
+        Self {
+            vertices,
+            texture_ix,
+        }
+    }
+
+    fn to_plane(&self) -> Plane {
+        // Use Newell's method to determine a plane equation so that concave
+        // polygons are correctly computed.
+        let mut normal = Vector3::zeros();
+        let mut point_a = &self.vertices.last().unwrap().position;
+        for point_b in self.vertices.iter().map(|x| &x.position) {
+            normal.x += (point_a.z + point_b.z) * (point_b.y - point_a.y);
+            normal.y += (point_a.x + point_b.x) * (point_b.z - point_a.z);
+            normal.z += (point_a.y + point_b.y) * (point_b.x - point_a.x);
+            point_a = point_b;
+        }
+        normal.normalize_mut();
+
+        let distance = normal.dot(&self.vertices[0].position);
+        Plane::new(normal, distance)
+    }
+
+    /// Return true if the polygon is perfectly planar. This function assumes
+    /// the given plane is coplanar with the first three vertices of the
+    /// polygon.
+    fn is_planar(&self, plane: &Plane) -> bool {
+        if self.vertices.len() == 3 {
+            return true;
+        }
+        self.vertices.iter().skip(3).all(|x| {
+            approx_eq!(
+                f64,
+                plane.normal.dot(&x.position),
+                plane.distance,
+                epsilon = 0.01,
+                ulps = 2i64.pow(48)
+            )
+        })
+    }
+
+    /// Split the polygon along the given plane. Returns a tuple of (front
+    /// polygon, back polygon).
+    fn split(&self, plane: &Plane, sides: &[PlaneSide]) -> (Self, Self) {
+        let mut front_polygon = Vec::new();
+        let mut back_polygon = Vec::new();
+
+        let mut side_a = sides.last().unwrap();
+        let mut point_a = self.vertices.last().unwrap();
+
+        for (side_b, point_b) in sides.iter().zip(&self.vertices) {
+            let mut insert_new_vertex = || {
+                let v = point_b.position - point_a.position;
+                let sect =
+                    -(plane.normal.dot(&point_a.position) - plane.distance) / plane.normal.dot(&v);
+                let new_position = point_a.position + v * sect;
+                let new_tex_coord =
+                    point_a.tex_coord + (point_b.tex_coord - point_a.tex_coord) * sect;
+                front_polygon.push(Vertex::new(new_position, new_tex_coord));
+                back_polygon.push(Vertex::new(new_position, new_tex_coord));
+            };
+
+            match side_b {
+                PlaneSide::Front => {
+                    if matches!(side_a, PlaneSide::Back) {
+                        insert_new_vertex();
+                    }
+                    front_polygon.push(point_b.clone());
+                }
+                PlaneSide::Back => {
+                    if matches!(side_a, PlaneSide::Front) {
+                        insert_new_vertex();
+                    }
+                    back_polygon.push(point_b.clone());
+                }
+                PlaneSide::Coplanar => {
+                    front_polygon.push(point_b.clone());
+                    back_polygon.push(point_b.clone());
+                }
+            }
+
+            side_a = side_b;
+            point_a = point_b;
+        }
+
+        (
+            BasicBspPolygon::new(front_polygon, self.texture_ix),
+            BasicBspPolygon::new(back_polygon, self.texture_ix),
+        )
+    }
+}
+
+struct PolygonPlaneClassification {
     plane: Plane,
     coplanar_ixs: HashSet<usize>,
     front_ixs: HashSet<usize>,
     back_ixs: HashSet<usize>,
     intersecting_ixs: HashMap<usize, Vec<PlaneSide>>,
+    basis: OrthonormalBasis2D,
 }
 
-impl ClassifiedPolygons {
-    fn new(plane: Plane, coplanar_ixs: HashSet<usize>, polygons: &[Polygon]) -> ClassifiedPolygons {
-        let mut result = ClassifiedPolygons {
+impl PolygonPlaneClassification {
+    fn new(
+        plane: Plane,
+        coplanar_ixs: HashSet<usize>,
+        polygons: &[BasicBspPolygon],
+    ) -> PolygonPlaneClassification {
+        let basis = OrthonormalBasis2D::from_plane(&plane);
+        let mut result = PolygonPlaneClassification {
             plane,
             coplanar_ixs,
             front_ixs: HashSet::new(),
             back_ixs: HashSet::new(),
             intersecting_ixs: HashMap::new(),
+            basis,
         };
 
         for (i, other) in polygons.iter().enumerate() {
@@ -40,12 +193,12 @@ impl ClassifiedPolygons {
     /// Classify the given polygon as at least partially in front, at least
     /// partially behind, or intersecting our plane, adding its index to the
     /// corresponding sets.
-    fn classify(&mut self, polygon_ix: usize, polygon: &Polygon) {
+    fn classify(&mut self, polygon_ix: usize, polygon: &BasicBspPolygon) {
         let sides: Vec<PlaneSide> = polygon
             .vertices
             .iter()
             .map(|v| {
-                let this_distance = v.position.dot(&self.plane.normal);
+                let this_distance = self.plane.normal.dot(&v.position);
                 if approx_eq!(
                     f64,
                     this_distance,
@@ -81,7 +234,7 @@ impl ClassifiedPolygons {
     /// Given a polygon that has been split. We only need to recalculate the
     /// full reclassification if this polygon was previously classified as an
     /// intersection, since it may potentially now be wholly in front or behind.
-    fn reclassify_split(&mut self, polygon_ix: usize, polygon: &Polygon) {
+    fn reclassify_split(&mut self, polygon_ix: usize, polygon: &BasicBspPolygon) {
         match self.intersecting_ixs.entry(polygon_ix) {
             Occupied(entry) => entry.remove_entry(),
             Vacant(_) => return,
@@ -108,78 +261,46 @@ impl ClassifiedPolygons {
             .map(|(k, v)| (*k, v.clone()))
             .collect();
 
-        Some(ClassifiedPolygons {
+        Some(PolygonPlaneClassification {
             plane: self.plane.clone(),
             coplanar_ixs,
             front_ixs,
             back_ixs,
             intersecting_ixs,
+            basis: self.basis.clone(),
         })
     }
 }
 
-#[derive(Serialize, Debug)]
-struct Node {
-    polygons: Vec<Polygon>,
-    normal: Vector3<f64>,
-    distance: f64,
-    children: [Option<usize>; 2],
+pub struct BasicBspNode {
+    pub polygons: Vec<BasicBspPolygon>,
+    pub plane: Plane,
+    pub front_child: Option<usize>,
+    pub back_child: Option<usize>,
+    // We don't need the basis for the BSP stage, but we calculate it here so
+    // that we can do fewer calculations down the line.
+    pub basis: OrthonormalBasis2D,
 }
 
-impl Node {
+impl BasicBspNode {
     fn new(
-        polygons: Vec<Polygon>,
-        normal: Vector3<f64>,
-        distance: f64,
-        children: [Option<usize>; 2],
+        polygons: Vec<BasicBspPolygon>,
+        plane: Plane,
+        front_child: Option<usize>,
+        back_child: Option<usize>,
+        basis: OrthonormalBasis2D,
     ) -> Self {
         Self {
             polygons,
-            normal,
-            distance,
-            children,
+            plane,
+            front_child,
+            back_child,
+            basis,
         }
     }
 }
 
-#[derive(Serialize)]
-pub struct BspTree {
-    nodes: Vec<Node>,
-    texture_names: Vec<String>,
-}
-
-impl BspTree {
-    pub fn new(obj: RawObj) -> Result<Self> {
-        let (polygons, texture_names) = collect_polygons(obj)?;
-
-        let planes: Vec<Plane> = polygons
-            .par_iter()
-            .map(|polygon| polygon.to_plane())
-            .collect();
-
-        if izip!(&polygons, &planes).any(|(polygon, plane)| !polygon.is_planar(plane)) {
-            return Err(anyhow!("Non-planar polygon encountered"));
-        }
-
-        let collapsed_planes = collapse_planes(&planes);
-
-        let planes = collapsed_planes
-            .into_par_iter()
-            .map(|(plane, coplanar_ixs)| ClassifiedPolygons::new(plane, coplanar_ixs, &polygons))
-            .collect();
-
-        // println!("{}", serde_yaml::to_string(&planes).unwrap());
-
-        let nodes = build_tree(polygons, planes);
-
-        Ok(BspTree {
-            nodes,
-            texture_names,
-        })
-    }
-}
-
-fn collect_polygons(obj: obj::raw::RawObj) -> Result<(Vec<Polygon>, Vec<String>)> {
+fn collect_polygons_from_obj(obj: obj::raw::RawObj) -> Result<(Vec<BasicBspPolygon>, Vec<String>)> {
     // We expect a model with Up as +Y, Forward as -Z, and vertices arranged in
     // counter-clockwise order. We want a coordinate system with Up as -Y,
     // Forward as +Z, and vertices arranged in clockwise order. We achieve this
@@ -216,7 +337,7 @@ fn collect_polygons(obj: obj::raw::RawObj) -> Result<(Vec<Polygon>, Vec<String>)
                         .collect(),
                     _ => return Err(anyhow!("Model must only contain polygons with texture UVs")),
                 };
-                polygons.push(Polygon::new(vertices, texture_ix));
+                polygons.push(BasicBspPolygon::new(vertices, texture_ix));
             }
         }
     }
@@ -224,7 +345,10 @@ fn collect_polygons(obj: obj::raw::RawObj) -> Result<(Vec<Polygon>, Vec<String>)
     Ok((polygons, texture_names))
 }
 
-fn build_tree(polygons: Vec<Polygon>, mut planes: Vec<ClassifiedPolygons>) -> Vec<Node> {
+fn build_tree(
+    polygons: Vec<BasicBspPolygon>,
+    mut planes: Vec<PolygonPlaneClassification>,
+) -> Vec<BasicBspNode> {
     // TODO: Heuristically choose a plane to split.
     let plane = match planes.pop() {
         Some(plane) => plane,
@@ -257,7 +381,7 @@ fn build_tree(polygons: Vec<Polygon>, mut planes: Vec<ClassifiedPolygons>) -> Ve
             back_polygons[index] = back_polygon;
         });
 
-    let reclassify = |mut other_plane: ClassifiedPolygons, polygons: &[Polygon]| {
+    let reclassify = |mut other_plane: PolygonPlaneClassification, polygons: &[BasicBspPolygon]| {
         plane.intersecting_ixs.iter().for_each(|(&index, _)| {
             other_plane.reclassify_split(index, &polygons[index]);
         });
@@ -280,22 +404,122 @@ fn build_tree(polygons: Vec<Polygon>, mut planes: Vec<ClassifiedPolygons>) -> Ve
         || build_tree(back_polygons, back_planes),
     );
 
-    let children = [
-        if front_children.is_empty() {
-            None
-        } else {
-            Some(0)
-        },
-        if back_children.is_empty() {
-            None
-        } else {
-            Some(front_children.len())
-        },
-    ];
+    let front_child = if front_children.is_empty() {
+        None
+    } else {
+        Some(0)
+    };
+    let back_child = if back_children.is_empty() {
+        None
+    } else {
+        Some(front_children.len())
+    };
 
-    let head = Node::new(coplanar, plane.plane.normal, plane.plane.distance, children);
+    let head = BasicBspNode::new(coplanar, plane.plane, front_child, back_child, plane.basis);
     let mut tree = vec![head];
     tree.extend(front_children);
     tree.extend(back_children);
     tree
+}
+
+/// Given a list of planes, combine all coplanar entries. The return value is a
+/// list of tuples associating the average Plane value to the set of indices of
+/// all coplanar entries of the original list.
+fn collapse_planes(planes: &[Plane]) -> Vec<(Plane, HashSet<usize>)> {
+    // Create a list of values.
+    let mut value_ixs = vec![0; planes.len()];
+    let mut values = Vec::new();
+    let mut visited: HashSet<usize> = HashSet::new();
+
+    for (i, duplicates) in dedup_planes(planes.iter()).into_iter().enumerate() {
+        if visited.len() == planes.len() {
+            // No need to continue iterating if we've visited every vector.
+            break;
+        }
+        if visited.contains(&i) {
+            continue;
+        }
+        visited.extend(&duplicates);
+
+        // Store the index for every duplicate.
+        value_ixs[i] = values.len();
+        for j in duplicates.iter() {
+            value_ixs[*j] = values.len();
+        }
+
+        // Calculate average of all duplicates to be the canonical value.
+        let len = (duplicates.len() + 1) as f64;
+        let normal = (planes[i].normal
+            + duplicates
+                .iter()
+                .map(|&x| planes[x].normal)
+                .sum::<Vector3<f64>>())
+            / len;
+        let distance = (planes[i].distance
+            + duplicates.iter().map(|&x| planes[x].distance).sum::<f64>())
+            / len;
+        values.push(Plane::new(normal, distance));
+    }
+
+    // Generate the final result.
+    let mut map = HashMap::new();
+    for (ix, value_ix) in value_ixs.iter().enumerate() {
+        map.entry(value_ix).or_insert(HashSet::new()).insert(ix);
+    }
+    map.into_iter()
+        .map(|(&ix, set)| (values[ix].clone(), set))
+        .collect()
+}
+
+fn dedup_f64s<I, R>(it: I) -> Vec<HashSet<usize>>
+where
+    I: Iterator<Item = R> + Clone,
+    R: Borrow<f64>,
+{
+    let mut sorted_values: Vec<(usize, f64)> =
+        it.into_iter().map(|x| *x.borrow()).enumerate().collect();
+    sorted_values.sort_unstable_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap());
+    let mut result = vec![HashSet::new(); sorted_values.len()];
+    let mut lhs = 0;
+    let mut rhs = 1;
+    while lhs < sorted_values.len() && rhs < sorted_values.len() {
+        let (lhs_index, lhs_value) = sorted_values[lhs];
+        let (rhs_index, rhs_value) = sorted_values[rhs];
+        if approx_eq!(
+            f64,
+            lhs_value,
+            rhs_value,
+            epsilon = 0.01,
+            ulps = 2i64.pow(48)
+        ) {
+            result[lhs_index].insert(rhs_index);
+            result[rhs_index].insert(lhs_index);
+            rhs += 1;
+        } else {
+            lhs += 1;
+            rhs = lhs + 1;
+        }
+    }
+    result
+}
+
+fn dedup_planes<I, R>(it: I) -> Vec<HashSet<usize>>
+where
+    I: Iterator<Item = R> + Clone,
+    R: Borrow<Plane>,
+{
+    let x_equals = dedup_f64s(it.clone().map(|v| v.borrow().normal.x));
+    let y_equals = dedup_f64s(it.clone().map(|v| v.borrow().normal.y));
+    let z_equals = dedup_f64s(it.clone().map(|v| v.borrow().normal.z));
+    let d_equals = dedup_f64s(it.map(|v| v.borrow().distance));
+
+    izip!(x_equals, y_equals, z_equals, d_equals)
+        .map(|(x, y, z, d)| {
+            x.into_iter()
+                .filter(|k| y.contains(k))
+                .filter(|k| z.contains(k))
+                .filter(|k| d.contains(k))
+                .collect()
+        })
+        .collect()
 }
