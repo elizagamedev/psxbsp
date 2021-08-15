@@ -1,47 +1,45 @@
-//! This module triangulates a BSP tree's polygons into triangle strips.
+//! This module reduces a BSP tree's vertices into index-based lists.
 
 use earcutr::earcut;
 use std::collections::hash_map::Entry::{Occupied, Vacant};
 use std::collections::HashMap;
 
-use crate::{
-    bsp::{BasicBspNode, BasicBspPolygon, BasicBspTree},
-    geometry::{OrthonormalBasis2D, Plane, Vertex},
-};
+use crate::geometry::{OrthonormalBasis2D, Plane, Vertex};
+use crate::triangulation::{TriangulatedBspNode, TriangulatedBspTree};
 
-pub struct TriangulatedBspTree {
-    pub nodes: Vec<TriangulatedBspNode>,
+pub struct ReducedBspTree {
+    pub nodes: Vec<ReducedBspNode>,
     pub texture_names: Vec<String>,
 }
 
-impl TriangulatedBspTree {
-    pub fn from_basic_bsp_tree(tree: BasicBspTree) -> Self {
+impl ReducedBspTree {
+    pub fn from_triangulated_bsp_tree(tree: TriangulatedBspTree) -> Self {
         let nodes = tree
             .nodes
             .into_iter()
-            .map(|node| TriangulatedBspNode::from_basic_bsp_node(node))
+            .map(|node| ReducedBspNode::from_triangulated_bsp_node(node))
             .collect();
-        TriangulatedBspTree {
+        ReducedBspTree {
             nodes,
             texture_names: tree.texture_names,
         }
     }
 }
 
-pub struct TriangulatedBspNode {
-    pub triangle_sets: Vec<TriangulatedBspTriangleSet>,
-    pub plane: Plane,
-    pub front_child: Option<usize>,
-    pub back_child: Option<usize>,
+pub struct ReducedBspNode {
+    triangle_sets: Vec<ReducedBspTriangleSet>,
+    plane: Plane,
+    front_child: Option<usize>,
+    back_child: Option<usize>,
 }
 
-impl TriangulatedBspNode {
-    fn from_basic_bsp_node(node: BasicBspNode) -> Self {
+impl ReducedBspNode {
+    fn from_triangulated_bsp_node(node: TriangulatedBspNode) -> Self {
         let basis = node.basis;
         let triangle_sets = collapse_triangle_sets(
             node.polygons
                 .into_iter()
-                .map(|x| TriangulatedBspTriangleSet::from_basic_bsp_polygon(&basis, x)),
+                .map(|x| ReducedBspTriangleSet::from_basic_bsp_polygon(&basis, x)),
         );
         Self {
             triangle_sets,
@@ -52,13 +50,12 @@ impl TriangulatedBspNode {
     }
 }
 
-pub struct TriangulatedBspTriangleSet {
+struct ReducedBspTriangleSet {
     indices: Vec<usize>,
-    vertices: Vec<Vertex>,
     texture_ix: usize,
 }
 
-impl TriangulatedBspTriangleSet {
+impl ReducedBspTriangleSet {
     fn from_basic_bsp_polygon(basis: &OrthonormalBasis2D, polygon: BasicBspPolygon) -> Self {
         let polygon2d: Vec<_> = polygon
             .vertices
@@ -78,9 +75,9 @@ impl TriangulatedBspTriangleSet {
 
 /// Collapse triangle sets with the same texture index.
 fn collapse_triangle_sets(
-    triangle_sets: impl Iterator<Item = TriangulatedBspTriangleSet>,
-) -> Vec<TriangulatedBspTriangleSet> {
-    let mut map: HashMap<usize, TriangulatedBspTriangleSet> = HashMap::new();
+    triangle_sets: impl Iterator<Item = ReducedBspTriangleSet>,
+) -> Vec<ReducedBspTriangleSet> {
+    let mut map: HashMap<usize, ReducedBspTriangleSet> = HashMap::new();
     for triangle_set in triangle_sets {
         match map.entry(triangle_set.texture_ix) {
             Occupied(mut entry) => {
