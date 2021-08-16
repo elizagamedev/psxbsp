@@ -1,25 +1,30 @@
 //! This module reduces a BSP tree's vertices into index-based lists.
 
-use earcutr::earcut;
+use itertools::Itertools;
+use nalgebra::{Vector2, Vector3};
 use std::collections::hash_map::Entry::{Occupied, Vacant};
 use std::collections::HashMap;
+use std::hash::{Hash, Hasher};
 
-use crate::geometry::{OrthonormalBasis2D, Plane, Vertex};
-use crate::triangulation::{TriangulatedBspNode, TriangulatedBspTree};
+use crate::geometry::Plane;
+use crate::triangulation::{TriangulatedBspNode, TriangulatedBspTree, TriangulatedBspTriangleSet};
 
 pub struct ReducedBspTree {
+    pub positions: Vec<Vector3<f64>>,
     pub nodes: Vec<ReducedBspNode>,
     pub texture_names: Vec<String>,
 }
 
 impl ReducedBspTree {
     pub fn from_triangulated_bsp_tree(tree: TriangulatedBspTree) -> Self {
+        let mut position_index_map = PositionIndexMap::new();
         let nodes = tree
             .nodes
             .into_iter()
-            .map(|node| ReducedBspNode::from_triangulated_bsp_node(node))
+            .map(|node| ReducedBspNode::from_triangulated_bsp_node(node, &mut position_index_map))
             .collect();
         ReducedBspTree {
+            positions: position_index_map.positions,
             nodes,
             texture_names: tree.texture_names,
         }
@@ -27,6 +32,7 @@ impl ReducedBspTree {
 }
 
 pub struct ReducedBspNode {
+    position_ixs: Vec<usize>,
     triangle_sets: Vec<ReducedBspTriangleSet>,
     plane: Plane,
     front_child: Option<usize>,
@@ -34,14 +40,25 @@ pub struct ReducedBspNode {
 }
 
 impl ReducedBspNode {
-    fn from_triangulated_bsp_node(node: TriangulatedBspNode) -> Self {
-        let basis = node.basis;
-        let triangle_sets = collapse_triangle_sets(
-            node.polygons
-                .into_iter()
-                .map(|x| ReducedBspTriangleSet::from_basic_bsp_polygon(&basis, x)),
-        );
+    fn from_triangulated_bsp_node(
+        node: TriangulatedBspNode,
+        position_index_map: &mut PositionIndexMap,
+    ) -> Self {
+        let triangle_sets: Vec<ReducedBspTriangleSet> = node
+            .triangle_sets
+            .into_iter()
+            .map(|set| {
+                ReducedBspTriangleSet::from_triangulated_triangle_set(set, position_index_map)
+            })
+            .collect();
+        let position_ixs = triangle_sets
+            .iter()
+            .map(|x| x.position_ixs.iter().copied().sorted())
+            .kmerge()
+            .dedup()
+            .collect();
         Self {
+            position_ixs,
             triangle_sets,
             plane: node.plane,
             front_child: node.front_child,
@@ -51,47 +68,72 @@ impl ReducedBspNode {
 }
 
 struct ReducedBspTriangleSet {
-    indices: Vec<usize>,
+    position_ixs: Vec<usize>,
+    tex_coords: Vec<Vector2<f64>>,
     texture_ix: usize,
 }
 
 impl ReducedBspTriangleSet {
-    fn from_basic_bsp_polygon(basis: &OrthonormalBasis2D, polygon: BasicBspPolygon) -> Self {
-        let polygon2d: Vec<_> = polygon
+    fn from_triangulated_triangle_set(
+        triangle_set: TriangulatedBspTriangleSet,
+        position_index_map: &mut PositionIndexMap,
+    ) -> Self {
+        let position_ixs = triangle_set
             .vertices
             .iter()
-            .map(|x| basis.transform(&x.position))
-            .flatten()
+            .map(|x| position_index_map.get_ix(x.position))
             .collect();
-        let mut indices = earcut(&polygon2d, &vec![], 2);
-        indices.reverse();
+        let tex_coords = triangle_set.vertices.iter().map(|x| x.tex_coord).collect();
         Self {
-            indices,
-            vertices: polygon.vertices,
-            texture_ix: polygon.texture_ix,
+            position_ixs,
+            tex_coords,
+            texture_ix: triangle_set.texture_ix,
         }
     }
 }
 
-/// Collapse triangle sets with the same texture index.
-fn collapse_triangle_sets(
-    triangle_sets: impl Iterator<Item = ReducedBspTriangleSet>,
-) -> Vec<ReducedBspTriangleSet> {
-    let mut map: HashMap<usize, ReducedBspTriangleSet> = HashMap::new();
-    for triangle_set in triangle_sets {
-        match map.entry(triangle_set.texture_ix) {
-            Occupied(mut entry) => {
-                let sum_set = entry.get_mut();
-                let offset = sum_set.vertices.len();
-                sum_set
-                    .indices
-                    .extend(triangle_set.indices.iter().map(|&ix| ix + offset));
-                sum_set.vertices.extend(triangle_set.vertices);
-            }
-            Vacant(entry) => {
-                entry.insert(triangle_set);
+struct PositionIndexMap {
+    map: HashMap<HashableVector3, usize>,
+    positions: Vec<Vector3<f64>>,
+}
+
+impl PositionIndexMap {
+    fn new() -> Self {
+        Self {
+            map: HashMap::new(),
+            positions: Vec::new(),
+        }
+    }
+
+    fn get_ix(&mut self, position: Vector3<f64>) -> usize {
+        match self.map.entry(HashableVector3(position)) {
+            Occupied(e) => *e.get(),
+            Vacant(e) => {
+                let result = self.positions.len();
+                e.insert(result);
+                self.positions.push(position);
+                result
             }
         }
     }
-    map.into_iter().map(|(_, v)| v).collect()
+}
+
+struct HashableVector3(Vector3<f64>);
+
+impl PartialEq for HashableVector3 {
+    fn eq(&self, other: &Self) -> bool {
+        return *self.0 == *other.0;
+    }
+}
+impl Eq for HashableVector3 {}
+
+impl Hash for HashableVector3 {
+    fn hash<H>(&self, state: &mut H)
+    where
+        H: Hasher,
+    {
+        self.0.x.to_bits().hash(state);
+        self.0.y.to_bits().hash(state);
+        self.0.z.to_bits().hash(state);
+    }
 }

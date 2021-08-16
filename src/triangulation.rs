@@ -53,9 +53,9 @@ impl TriangulatedBspNode {
 }
 
 pub struct TriangulatedBspTriangleSet {
-    indices: Vec<usize>,
-    vertices: Vec<Vertex>,
-    texture_ix: usize,
+    pub indices: Vec<usize>,
+    pub vertices: Vec<Vertex>,
+    pub texture_ix: usize,
 }
 
 impl TriangulatedBspTriangleSet {
